@@ -1,33 +1,36 @@
 # Deal Scout
 
-A React web UI backed by an **agent that finds the best US deal on a product you type in** — restricted to a strict, non-overridable set of common **above-the-belt** items. Powered by a **free Nemotron model** via OpenRouter.
+A React web UI backed by an **agent that finds the best US deal on a product you type in** — with a hard, non-overridable block on weapons, illegal drugs, adult content, and anything harmful, hazardous or illicit. Powered by a **free Nemotron model** via OpenRouter.
 
-**Live link:** none yet — this app needs the Node backend running (it holds the API key and the guardrail), so it isn't a static GitHub Pages site. Run it locally with the steps below.
+**Live link:** none yet — this app needs the Node backend running (it holds the API key and the filter), so it isn't a static GitHub Pages site. Run it locally with the steps below.
 
 ---
 
 ## What it does
 
-1. You type a product (e.g. *"mens cotton polo shirt"*).
-2. The server runs it through a **hard-coded guardrail** that only allows common above-the-belt items — tops, layers, headwear, neckwear and upper-body accessories.
-3. If allowed, a free **NVIDIA Nemotron** model (via OpenRouter, with live web search) finds current offers from **US retailers only**, in USD.
+1. You type a product (e.g. *"air fryer"*, *"running shoes"*, *"cotton polo shirt"*).
+2. The server runs it through a **content filter**: a hard-coded prohibited-term screen in code, then a model safety classifier that catches slang and paraphrase.
+3. If cleared, a free **NVIDIA Nemotron** model (via OpenRouter, with live web search) finds current offers from **US retailers only**, in USD.
 4. Offers are post-filtered and ranked server-side; the cheapest is shown as the **best deal**.
 
-Anything at or below the belt line, and anything that isn't an above-the-belt item, is refused before any model call.
+Anything prohibited is refused before any shopping search runs.
 
 ---
 
-## The guardrail (the important part)
+## The filter (the important part)
 
-The restriction "only common above-the-belt items" lives in **`server/guardrail.js`** and cannot be changed from the UI, from a request, or from a prompt:
+Deal Scout is a general shopping agent — it searches for everyday products. What it will **never** search for lives in **`server/guardrail.js`** and cannot be changed from the UI, from a request, or from a prompt:
 
-- **Hard-coded tables.** The allowed categories and denied terms are constants in that one file. There is no database row, no config flag and no runtime switch.
-- **Server-side.** It runs in Node, outside the model. The LLM is only a tie-breaker for words the tables don't recognise, and its answer is re-validated by the same deterministic code.
-- **Fail-closed.** A query must *positively* match an allowed category to proceed; a deny match always wins over an allow match.
-- **One input field.** `POST /api/search` accepts exactly one field (`query`). Extra fields like `allowlist`, `systemPrompt` or `model` are ignored, so a caller cannot smuggle in an override.
-- **Defence in depth.** Result titles are re-screened against the same deny table, so a bad offer can't slip through even if the model returns it.
+- **Hard-coded tables.** The prohibited-term groups are constants in that one file. There is no database row, no config flag and no runtime switch.
+- **Server-side.** It runs in Node, outside the model. The classifier is a second opinion only.
+- **Monotonic.** A code match ALWAYS blocks. Nothing the model says can un-block it — the model can only *add* a block, never remove one. A model verdict of "safe" is re-validated by the same deterministic code.
+- **Fail-closed.** If the safety classifier can't run, the request is not searched.
+- **One input field.** `POST /api/search` accepts exactly one field (`query`). Extra fields like `allowlist`, `systemPrompt` or `model` are ignored, so a caller cannot smuggle in a bypass.
+- **Defence in depth.** Result titles are re-screened against the same tables, so a prohibited listing can't slip through even if the model returns it.
 
-Denied by design: pants, shorts, skirts, dresses, belts, shoes, socks, underwear, swimwear, and non-apparel goods. See `DENIED_TERMS` / `OUT_OF_SCOPE_TERMS` in `server/guardrail.js`.
+**Blocked:** weapons, ammunition and explosives · illegal drugs and drug paraphernalia · adult or sexual content · tobacco, vaping and alcohol · hazardous, toxic and explosive materials · counterfeit, stolen and fraudulent goods · hacking and surveillance tools · protected wildlife and human remains · hate symbols and extremist merchandise.
+
+**Not blocked (deliberate):** legitimate look-alikes — glue guns, nail guns, shotgun microphones, wine glasses, beer mugs, bullet journals, bath bombs, kitchen knives, isopropyl alcohol, cigarette pants, cigar-box guitars. Each has an explicit exclusion in the tables, and the list was tested in both directions (43/43 prohibited queries blocked, 42/42 ordinary products allowed).
 
 ---
 
@@ -67,25 +70,26 @@ Requires Node 18+ (developed on Node 22).
 | `WEB_SEARCH` | `true` (default) to enable OpenRouter's web-search plugin. |
 | `PORT` | API port. Default `3033`. |
 
-## Cost note
+## Cost and latency notes
 
-The **Nemotron model itself is free** (OpenRouter `:free` tier). The live price data comes from OpenRouter's **web-search plugin**, which is billed by OpenRouter at roughly **$0.004–0.007 per search**. Set `WEB_SEARCH=false` to run 100% free — results will then be empty unless you wire up a shopping API. There is no free keyless US shopping API, which is why the grounded web search is used.
+- The **Nemotron model itself is free** (OpenRouter `:free` tier). Live price data comes from OpenRouter's **web-search plugin**, billed by OpenRouter at roughly **$0.004–0.007 per search**. Set `WEB_SEARCH=false` to run 100% free — results will then be empty unless you wire up a shopping API. There is no free keyless US shopping API, which is why the grounded web search is used.
+- A search typically takes **10–70 seconds**: the safety pass is ~1–2s, but the free reasoning model + live web fetch dominate, and the length of its thinking varies run to run.
 
 ## API
 
 - `GET /api/health` — liveness, active model, whether web search is on
-- `GET /api/catalog` — the allowed above-the-belt categories (used for the UI chips)
+- `GET /api/catalog` — example searches + the blocked categories (used by the UI)
 - `POST /api/search` `{ "query": "..." }` — returns `{ blocked, verdict, offers, best, steps, meta }`
 
 ## Layout
 
 ```
 server/
-  index.js        Express API + US-only + post-filters + ranking
-  guardrail.js    THE immutable above-the-belt allow/deny tables
-  agent.js        free-Nemotron calls (classify + grounded US deal research)
+  index.js        Express API + US-only + merchant-direct + post-filters + ranking
+  guardrail.js    THE immutable prohibited-term tables + screen/validate
+  agent.js        free-Nemotron calls (safety classifier + grounded US deal research)
 src/
   App.tsx         main UI
-  components/     SearchBar, CategoryChips, AgentTimeline, DealCard, ...
+  components/     SearchBar, ExampleChips, AgentTimeline, DealCard, ...
   styles/main.scss
 ```

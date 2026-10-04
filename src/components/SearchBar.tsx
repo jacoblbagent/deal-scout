@@ -21,7 +21,7 @@ export default function SearchBar({ value, onChange, onSubmit, loading }: Props)
         autoComplete="off"
         spellCheck={false}
         maxLength={80}
-        placeholder="e.g. men's cotton polo shirt"
+        placeholder="e.g. air fryer"
         value={value}
         onChange={(e) => onChange(e.target.value)}
         aria-label="Product to search for"

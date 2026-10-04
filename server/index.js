@@ -19,8 +19,8 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-import { evaluate, validateModelVerdict, offerTitleAllowed, catalog } from './guardrail.js'
-import { classify, research, webSearchEnabled, activeModel } from './agent.js'
+import { screen, validateSafety, offerTitleSafe, catalog } from './guardrail.js'
+import { safetyCheck, research, webSearchEnabled, activeModel } from './agent.js'
 
 const app = express()
 app.use(cors())
@@ -54,6 +54,14 @@ const FOREIGN_TLDS = new Set([
 ])
 const OK_TLDS = new Set(['com', 'us', 'org', 'net', 'shop', 'store'])
 
+// Deal aggregators and social sites — they aren't the merchant, so a price
+// shown there can't be bought there. Drop them so every offer is merchant-direct.
+const NON_MERCHANT = [
+  'slickdeals.net', 'dealnews.com', 'bradsdeals.com', 'reddit.com', 'youtube.com',
+  'pinterest.com', 'facebook.com', 'instagram.com', 'tiktok.com', 'twitter.com',
+  'x.com', 'medium.com', 'blogspot.com', 'wordpress.com', 'quora.com'
+]
+
 function isUSListing(url) {
   let host
   try {
@@ -61,6 +69,7 @@ function isUSListing(url) {
   } catch {
     return false
   }
+  if (NON_MERCHANT.some((d) => host === d || host.endsWith('.' + d))) return false
   if (US_RETAILERS.some((d) => host === d || host.endsWith('.' + d))) return true
   const tld = host.split('.').pop()
   if (FOREIGN_TLDS.has(tld)) return false
@@ -115,7 +124,7 @@ app.get('/api/health', (_req, res) => {
 })
 
 app.get('/api/catalog', (_req, res) => {
-  res.json({ categories: catalog() })
+  res.json(catalog())
 })
 
 app.post('/api/search', async (req, res) => {
@@ -132,28 +141,36 @@ app.post('/api/search', async (req, res) => {
     return res.status(400).json({ ok: false, blocked: true, reason: 'Enter a product to search for.', steps })
   }
 
-  // ---- Gate 2: immutable guardrail (deterministic, no model involved). ----
-  let verdict = evaluate(query)
+  // ---- Gate 2: deterministic content screen (no model involved). ----
+  let verdict = screen(query)
   steps.push({
-    step: 'guardrail',
+    step: 'filter',
     status: verdict.allowed ? 'ok' : 'blocked',
-    detail: verdict.allowed ? `Allowed · ${verdict.label}` : verdict.reason
+    detail: verdict.allowed ? 'No prohibited term detected' : verdict.reason
   })
 
-  // Grey zone only: recognised as nothing, but not explicitly denied. Ask the
-  // model to classify, then let code re-validate. A deny never reaches here.
-  if (!verdict.allowed && verdict.matchedTerm === null && !verdict.reason.startsWith('Query') && !verdict.reason.startsWith('Enter')) {
+  // ---- Gate 3: model safety pass. Only ever ADDS a block; the model can
+  // never un-block something the code tables caught. Fail-closed: if the
+  // check can't run, we don't search. ----
+  if (verdict.allowed) {
     try {
-      const guess = await classify({ query, model: activeModel(), apiKey: API_KEY })
-      const confirmed = validateModelVerdict(query, guess)
-      steps.push({
-        step: 'classify',
-        status: confirmed.allowed ? 'ok' : 'blocked',
-        detail: confirmed.allowed ? `Model confirmed · ${confirmed.label}` : 'Model found no allowed above-the-belt item'
-      })
+      const guess = await safetyCheck({ query, model: activeModel(), apiKey: API_KEY })
+      const confirmed = validateSafety(query, guess)
       verdict = confirmed
+      steps.push({
+        step: 'safety',
+        status: confirmed.allowed ? 'ok' : 'blocked',
+        detail: confirmed.allowed ? 'Cleared by safety classifier' : confirmed.reason
+      })
     } catch (err) {
-      steps.push({ step: 'classify', status: 'error', detail: err.message })
+      verdict = {
+        allowed: false,
+        reason: "Couldn't verify this request is safe (safety check unavailable). Please try again.",
+        code: null,
+        label: null,
+        matchedTerm: null
+      }
+      steps.push({ step: 'safety', status: 'error', detail: err.message })
     }
   }
 
@@ -212,7 +229,7 @@ app.post('/api/search', async (req, res) => {
     if (currency !== 'USD') continue
     if (price == null || price <= 0 || price > 20000) continue
     if (!isUSListing(url)) continue
-    if (!offerTitleAllowed(`${title} ${raw?.retailer ?? ''}`)) continue
+    if (!offerTitleSafe(`${title} ${raw?.retailer ?? ''}`)) continue
     const key = normalizeUrl(url)
     // Secondary key: same retailer + same title + same price is the same
     // listing even if the URL differs (e.g. two storefront hosts).

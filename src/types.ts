@@ -51,8 +51,12 @@ export interface SearchResponse {
   }
 }
 
-export interface Category {
+export interface ProhibitedGroup {
   code: string
   label: string
-  example: string
+}
+
+export interface Catalog {
+  examples: string[]
+  prohibited: ProhibitedGroup[]
 }

@@ -1,4 +1,4 @@
-import type { Category, SearchResponse } from './types'
+import type { Catalog, SearchResponse } from './types'
 
 /** The only field the API accepts is `query`. Nothing else is sent. */
 export async function search(query: string, signal?: AbortSignal): Promise<SearchResponse> {
@@ -15,10 +15,9 @@ export async function search(query: string, signal?: AbortSignal): Promise<Searc
   return data
 }
 
-export async function getCatalog(): Promise<Category[]> {
+export async function getCatalog(): Promise<Catalog> {
   const res = await fetch('/api/catalog')
-  const data = (await res.json()) as { categories: Category[] }
-  return data.categories
+  return (await res.json()) as Catalog
 }
 
 export function formatUSD(n: number): string {

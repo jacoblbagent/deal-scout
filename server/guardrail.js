@@ -1,27 +1,28 @@
 /**
- * guardrail.js — ABOVE-THE-BELT ENFORCEMENT
+ * guardrail.js — CONTENT SAFETY FILTER
  * =====================================================================
- * This module is the single source of truth for what Deal Scout may search
- * for. It is deliberately:
+ * Deal Scout is a general product price-finder. It will search for almost
+ * anything a normal person would shop for — EXCEPT weapons, illegal drugs,
+ * adult/sexual content, and anything harmful, hazardous or illicit.
  *
- *   1. HARD-CODED  — the allow/deny tables live in this file and nowhere
- *      else. There is no database row, no config flag, no request parameter
- *      and no prompt that can add to, remove from, or disable them.
- *   2. SERVER-SIDE  — it runs in Node, outside the model. The LLM is never
- *      asked "is this allowed?" as a first-line authority; it is only ever a
- *      tie-breaker for words the tables don't recognise, and its answer is
- *      re-validated by the same deterministic code below.
- *   3. FAIL-CLOSED  — a query must POSITIVELY match an allowed category to
- *      proceed. Anything unrecognised is refused. A deny match always wins
- *      over an allow match, in every code path.
+ * This module is the single source of truth for what is blocked. It is:
  *
- * Nothing in the API surface can reach these tables. `POST /api/search`
- * accepts exactly one field (`query`); every other field is discarded, so a
- * caller cannot smuggle in an `allowlist`, `systemPrompt` or `model`
- * override. That is the "cannot be overwritten" guarantee.
+ *   1. HARD-CODED  — the prohibited-term tables live in this file and nowhere
+ *      else. No database row, config flag, request parameter or prompt can
+ *      add to, remove from, or disable them.
+ *   2. SERVER-SIDE  — it runs in Node, outside the model. The LLM is a second
+ *      opinion for phrasing the tables miss; it can only ADD blocks, never
+ *      remove one. Its verdict is re-validated by this code.
+ *   3. MONOTONIC   — a code match ALWAYS blocks. Nothing the model says, and
+ *      nothing in the request, can un-block it. That is the "cannot be
+ *      overwritten" guarantee.
  *
- * If you (an operator) want to change what is searchable, you edit this file
- * and redeploy. There is intentionally no runtime switch.
+ * `POST /api/search` accepts exactly one field (`query`); every other field
+ * is discarded, so a caller cannot smuggle in `allowlist`, `systemPrompt`,
+ * `model` or a filter bypass.
+ *
+ * To change what's blocked, edit this file and redeploy. There is
+ * intentionally no runtime switch.
  */
 
 /** Lowercase, strip punctuation, collapse whitespace. Hyphens become spaces. */
@@ -37,191 +38,250 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const termRe = (term) => new RegExp(`\\b${escapeRe(term).replace(/ /g, '\\s+')}\\b`)
 
 /**
- * ALLOWED CATEGORIES — items worn ABOVE the belt line.
- * Everything here is a top, a layer, headwear, neckwear, an upper-body
- * accessory, or an arm/hand covering. Each entry has a stable `code` the UI
- * uses for chips and labels.
+ * PROHIBITED GROUPS. Each term is either a string, or a `[term, excludeSrc]`
+ * pair where `excludeSrc` is a regex (tested against the normalised query)
+ * that suppresses the match for legitimate look-alikes — e.g. "glue gun"
+ * (a craft tool) vs "gun", or "wine glass" (glassware) vs "wine".
  */
-export const ALLOWED_CATEGORIES = [
-  { code: 'tshirt',     label: 'T-Shirt / Tank',  terms: ['t-shirt', 't shirt', 'tshirt', 'tee shirt', 'tee', 'tees', 'graphic tee', 'graphic t shirt', 'tank top', 'tank', 'camisole', 'cami', 'crop top'] },
-  { code: 'shirt',      label: 'Shirt / Blouse',  terms: ['dress shirt', 'button-down', 'button down', 'button-up', 'button up', 'oxford shirt', 'flannel shirt', 'flannel', 'henley', 'blouse', 'shirt'] },
-  { code: 'polo',       label: 'Polo',            terms: ['polo shirt', 'polo'] },
-  { code: 'sweatshirt', label: 'Hoodie / Sweatshirt', terms: ['hoodie', 'hoody', 'sweatshirt', 'sweat shirt', 'crewneck', 'crew neck', 'pullover hoodie'] },
-  { code: 'sweater',    label: 'Sweater',         terms: ['sweater', 'jumper', 'cardigan', 'turtleneck', 'pullover', 'fleece pullover'] },
-  { code: 'jacket',     label: 'Jacket / Coat',   terms: ['suit jacket', 'sport coat', 'denim jacket', 'rain jacket', 'bomber jacket', 'windbreaker', 'parka', 'blazer', 'overcoat', 'trench coat', 'jacket', 'coat'] },
-  { code: 'vest',       label: 'Vest',            terms: ['vest', 'gilet', 'waistcoat'] },
-  { code: 'hat',        label: 'Hat / Cap',       terms: ['baseball cap', 'trucker hat', 'bucket hat', 'sun hat', 'beanie', 'snapback', 'fedora', 'beret', 'visor', 'cap', 'hat'] },
-  { code: 'headband',   label: 'Headband',        terms: ['headband', 'sweatband', 'head wrap', 'bandana', 'bandanna'] },
-  { code: 'scarf',      label: 'Scarf / Neckwear', terms: ['scarf', 'scarves', 'shawl', 'neck gaiter', 'balaclava', 'snood'] },
-  { code: 'tie',        label: 'Tie',             terms: ['bow tie', 'bowtie', 'necktie', 'cravat', 'tie', 'ties'] },
-  { code: 'gloves',     label: 'Gloves',          terms: ['fingerless gloves', 'mittens', 'mitts', 'gloves', 'glove'] },
-  { code: 'eyewear',    label: 'Eyewear',         terms: ['sunglasses', 'sunglass', 'eyeglasses', 'spectacles', 'reading glasses', 'blue light glasses', 'goggles', 'glasses'] },
-  { code: 'bag',        label: 'Backpack / Bag',  terms: ['backpack', 'rucksack', 'messenger bag', 'crossbody bag', 'shoulder bag', 'fanny pack', 'sling bag', 'tote bag', 'duffel bag', 'briefcase'] },
-  { code: 'jewelry',    label: 'Necklace / Earrings', terms: ['necklace', 'pendant', 'earrings', 'earring', 'studs', 'bracelet', 'bangle', 'brooch'] },
-  { code: 'watch',      label: 'Watch',           terms: ['wristwatch', 'watch'] },
-  { code: 'wrap',       label: 'Poncho / Cape',   terms: ['poncho', 'cape', 'serape'] }
-]
-
-/**
- * DENIED — anything worn at or below the belt line, or otherwise out of scope
- * (non-apparel goods, regulated items). A match here refuses the query
- * unconditionally, even if an allowed word is also present.
- */
-export const DENIED_TERMS = [
-  // Lower body / legwear
-  'pants', 'pant', 'trousers', 'jeans', 'jean', 'chinos', 'slacks', 'shorts',
-  'joggers', 'sweatpants', 'sweat pants', 'leggings', 'tights', 'cargo pants',
-  'skirt', 'skirts', 'dress', 'dresses', 'gown', 'romper', 'jumpsuit',
-  'overalls', 'pantsuit', 'culottes', 'capris',
-  // Footwear
-  'shoes', 'shoe', 'sneakers', 'sneaker', 'boots', 'boot', 'sandals', 'sandal',
-  'flip flops', 'loafers', 'loafer', 'heels', 'high heels', 'cleats',
-  'slippers', 'slipper', 'insole', 'insoles', 'shoelaces', 'shoe laces',
-  // Socks / hosiery
-  'socks', 'sock', 'stockings', 'pantyhose',
-  // Waist / belt
-  'belt', 'belts', 'suspenders', 'braces', 'garter',
-  // Underwear / lingerie
-  'underwear', 'boxers', 'boxer briefs', 'briefs', 'panties', 'thong', 'bra',
-  'lingerie', 'trunks', 'jockstrap',
-  // Swimwear
-  'swimsuit', 'swim trunks', 'bikini', 'bikini bottom', 'swim shorts',
-  'board shorts', 'bathing suit', 'swim briefs', 'rash guard',
-  // Ankle / lower accessories
-  'anklet', 'ankle bracelet', 'leg warmers'
-]
-
-/**
- * OUT-OF-SCOPE — not apparel worn above the belt at all, or goods Deal Scout
- * refuses outright. Denied for the same non-negotiable reasons as above.
- */
-export const OUT_OF_SCOPE_TERMS = [
-  'gun', 'firearm', 'rifle', 'pistol', 'handgun', 'ammo', 'ammunition',
-  'knife', 'knives', 'explosive', 'fireworks', 'drug', 'drugs', 'cocaine',
-  'heroin', 'meth', 'fentanyl', 'medication', 'prescription', 'pill',
-  'alcohol', 'vodka', 'whiskey', 'beer', 'wine', 'liquor', 'cigarette',
-  'cigarettes', 'vape', 'vape pen', 'tobacco', 'nicotine',
-  'laptop', 'computer', 'phone', 'iphone', 'smartphone', 'tablet', 'tv',
-  'television', 'sofa', 'couch', 'mattress', 'refrigerator', 'appliance',
-  'car', 'truck', 'motorcycle', 'tire', 'engine', 'live animal', 'puppy',
-  'kitten', 'stock', 'stocks', 'crypto', 'nft', 'lottery', 'gift card',
-  'real estate', 'ammo can'
+export const PROHIBITED_GROUPS = [
+  {
+    code: 'weapons',
+    label: 'weapons, ammunition or explosives',
+    terms: [
+      ['gun', '\\b(glue|nail|spray|caulking|caulk|paint|staple|heat|soldering|solder|rivet|stud|brad|water|squirt|nerf|toy|airsoft|paintball|bubble|foam|hot\\s+glue)\\s+guns?\\b'],
+      ['guns', '\\b(glue|nail|spray|caulking|caulk|paint|staple|heat|soldering|solder|rivet|stud|brad|water|squirt|nerf|toy|airsoft|paintball|bubble|foam|hot\\s+glue)\\s+guns?\\b'],
+      'firearm', 'firearms', 'handgun', 'handguns', 'pistol', 'pistols', 'revolver',
+      'revolvers', 'rifle', 'rifles', 'uzi', 'glock', 'sig sauer', 'ar 15', 'ar15',
+      'ak 47', 'ak47', 'assault rifle', 'machine gun', 'submachine gun',
+      ['shotgun', '\\bshotgun\\s+(mic|mics|microphone|microphones)\\b'],
+      'bump stock', 'lower receiver', 'ghost gun', 'high capacity magazine',
+      'gun magazine', 'silencer', 'suppressor', 'ammunition', 'ammo',
+      ['bullets', '\\bbullets?\\s+(journal|journals|points?)\\b'],
+      'brass casings', 'armor piercing', 'hollow point', 'tracer rounds',
+      'taser', 'stun gun', 'stun baton', 'pepper spray', 'mace spray',
+      'brass knuckles', 'knuckle duster', 'switchblade', 'butterfly knife',
+      'ballistic knife', 'gravity knife', 'dagger', 'daggers', 'machete',
+      'machetes', 'sword', 'swords', 'katana', 'combat knife', 'tactical knife',
+      'throwing knife', 'throwing star', 'shuriken', 'nunchaku', 'nunchucks',
+      'crossbow', 'crossbows', 'grenade', 'grenades',
+      ['bomb', '\\bbath\\s+bombs?\\b'],
+      ['bombs', '\\bbath\\s+bombs?\\b'], 'explosive', 'explosives', 'dynamite',
+      ['c4', '\\bcorvette\\b|\\bc4\\s+(transmission|transmissions|plastics?|plant|photosynthesis|model)'],
+      'tnt', 'detonator',
+      'blasting cap', 'flamethrower', 'missile', 'rocket launcher', 'landmine',
+      'land mine'
+    ]
+  },
+  {
+    code: 'drugs',
+    label: 'illegal drugs or drug paraphernalia',
+    terms: [
+      'cocaine', 'heroin', 'meth', 'methamphetamine', 'crystal meth', 'fentanyl',
+      'opium', 'morphine', 'oxycodone', 'oxycontin', 'percocet', 'vicodin',
+      'xanax', 'adderall', 'ritalin', 'valium', 'tramadol', 'suboxone', 'mdma',
+      'ecstasy', 'lsd', 'psilocybin', 'magic mushrooms', 'shrooms', 'ketamine',
+      'ghb', 'dmt', 'ayahuasca', 'peyote', 'anabolic steroids', 'steroids',
+      'trenbolone', 'clenbuterol', 'marijuana', 'cannabis', 'ganja',
+      'thc cartridge', 'thc vape', 'dab rig', 'crack pipe', 'meth pipe',
+      'bong', 'bongs', 'drug paraphernalia', 'narcotics', 'illegal drugs',
+      'prescription drugs', 'painkillers', 'opioids', 'syringe', 'syringes'
+    ]
+  },
+  {
+    code: 'adult',
+    label: 'adult or sexual content',
+    terms: [
+      'porn', 'porno', 'pornography', 'xxx', 'hentai', 'erotica',
+      ['nude', '\\bnude\\s+(lipstick|lip|shade|shades|heel|heels|tone|palette|leggings|bra|dress|pumps|leather)\\b'],
+      'nudes', 'naked', 'sex toy', 'sex toys', 'dildo', 'dildos', 'vibrator',
+      'butt plug', 'anal plug', 'fleshlight', 'masturbator', 'cock ring',
+      'penis pump', 'bdsm', 'bondage kit', 'fetish', 'escort service',
+      'prostitute', 'prostitution', 'strip club', 'strip clubs', 'stripper',
+      'onlyfans', 'camgirl', 'webcam girls', 'adult toys', 'sex doll',
+      'sex dolls', 'adult video', 'adult content', 'adult film'
+    ]
+  },
+  {
+    code: 'tobacco-alcohol',
+    label: 'tobacco, vaping or alcohol',
+    terms: [
+      ['cigarette', '\\bcigarette\\s+(pants|trousers|jeans)\\b'],
+      'cigarettes', ['cigar', '\\bcigar\\s+box\\s+guitars?\\b'], 'cigars', 'chewing tobacco', 'snuff', 'snus',
+      'nicotine', 'nicotine pouch', 'vape', 'vape pen', 'vape juice',
+      'e liquid', 'e cigarette', 'e cigarettes', 'juul', 'hookah', 'shisha',
+      ['alcohol', '\\b(isopropyl|rubbing|ethyl|denatured)\\s+alcohol\\b|\\balcohol\\s+(wipes|swabs|pad|pads|free|marker|markers|ink)\\b'],
+      ['beer', '\\bbeer\\s+(glass|glasses|mug|mugs|opener|openers|koozie|koozies|coozie|pong|tap|taps|growler|growlers|keg|kegs|fridge|cooler|paddle|making|kit)\\b'],
+      ['wine', '\\bwine\\s+(glass|glasses|rack|racks|opener|openers|stopper|stoppers|decanter|decanters|cooler|coolers|aerator|carafe|charm|charms|bag|tote|making|kit|fridge|refrigerator|cellar|preserver|thermometer|holder)\\b'],
+      ['whiskey', '\\bwhisk(e)?y\\s+(glass|glasses|stone|stones|decanter|barrel|barrels|making|flask)\\b'],
+      ['whisky', '\\bwhisk(e)?y\\s+(glass|glasses|stone|stones|decanter|barrel|barrels|making|flask)\\b'],
+      ['vodka', '\\bvodka\\s+(glass|glasses|decanter|making|kit)\\b'],
+      ['champagne', '\\bchampagne\\s+(flute|flutes|glass|glasses|bucket|stopper|charm|charms)\\b'],
+      'tequila', 'liquor', 'bourbon', 'absinthe', 'hard seltzer', 'malt liquor'
+    ]
+  },
+  {
+    code: 'hazmat',
+    label: 'hazardous, toxic or explosive materials',
+    terms: [
+      'poison', 'arsenic', 'cyanide', 'ricin', 'anthrax', 'sarin', 'nerve agent',
+      'mustard gas', 'chlorine gas', 'radioactive', 'uranium', 'plutonium',
+      'radium', 'asbestos', 'liquid mercury', 'sulfuric acid', 'hydrochloric acid',
+      'nitric acid', 'hydrofluoric acid', 'lye', 'ammonium nitrate',
+      'explosive precursor', 'thermite', 'napalm', 'white phosphorus',
+      'tear gas', 'cs gas'
+    ]
+  },
+  {
+    code: 'illicit',
+    label: 'counterfeit, stolen or fraudulent goods',
+    terms: [
+      'fake id', 'fake ids', 'counterfeit', 'counterfeits', 'counterfeit money',
+      'counterfeit currency', 'fake money', 'forged documents', 'fake passport',
+      'fake diploma', 'diploma mill', 'fake degree', 'stolen goods',
+      'stolen credit card', 'credit card dumps', 'cvv dumps', 'carding',
+      'fraud kit', 'card skimmer', 'atm skimmer', 'pirated', 'pirated software',
+      'cracked software', 'keygen', 'license key generator', 'stolen data',
+      'database dump'
+    ]
+  },
+  {
+    code: 'hacking',
+    label: 'hacking or surveillance tools',
+    terms: [
+      'keylogger', 'spyware', 'stalkerware', 'ransomware', 'malware',
+      'computer virus', 'hacking tool', 'hacking tools', 'ddos', 'botnet',
+      'remote access trojan', 'wifi jammer', 'signal jammer', 'cell jammer',
+      'gps jammer', 'spy camera', 'hidden camera', 'pen camera'
+    ]
+  },
+  {
+    code: 'wildlife',
+    label: 'protected wildlife or human remains',
+    terms: [
+      'live animal', 'live animals', 'puppy for sale', 'kitten for sale',
+      'live puppy', 'live kitten', 'ivory', 'elephant ivory', 'rhino horn',
+      'tiger bone', 'pangolin', 'bear bile', 'shark fin', 'whale meat',
+      'bushmeat', 'exotic animal', 'endangered species', 'protected species',
+      'human remains', 'human organs', 'body parts for sale', 'human bone'
+    ]
+  },
+  {
+    code: 'hate',
+    label: 'hate symbols or extremist merchandise',
+    terms: [
+      'swastika', 'nazi', 'neo nazi', 'neo nazis', 'white power',
+      'white supremacist', 'hate symbol', 'hate symbols', 'kkk',
+      'ku klux klan', 'hitler', 'third reich', 'ss uniform', 'terrorist flag',
+      'isis flag', 'extremist merchandise'
+    ]
+  }
 ]
 
 // Pre-compiled matchers (built once at module load; immutable thereafter).
-const ALLOW_MATCHERS = ALLOWED_CATEGORIES.map((c) => ({
-  code: c.code,
-  label: c.label,
-  terms: c.terms.map((t) => ({ raw: t, re: termRe(normalize(t)) }))
+const COMPILED = PROHIBITED_GROUPS.map((g) => ({
+  code: g.code,
+  label: g.label,
+  matchers: g.terms.map((entry) => {
+    const [term, excludeSrc] = Array.isArray(entry) ? entry : [entry, null]
+    return {
+      raw: term,
+      re: termRe(normalize(term)),
+      exclude: excludeSrc ? new RegExp(excludeSrc) : null
+    }
+  })
 }))
-const DENY_MATCHERS = [
-  ...DENIED_TERMS.map((t) => ({ raw: t, kind: 'below_belt', re: termRe(normalize(t)) })),
-  ...OUT_OF_SCOPE_TERMS.map((t) => ({ raw: t, kind: 'out_of_scope', re: termRe(normalize(t)) }))
-]
 
-/** Returns the longest matching allow phrase for a normalised query, or null. */
-function findAllowPhrase(q) {
-  let best = null
-  for (const cat of ALLOW_MATCHERS) {
-    for (const { raw, re } of cat.terms) {
-      if (re.test(q)) {
-        const n = normalize(raw)
-        if (!best || n.length > best.phrase.length) {
-          best = { code: cat.code, label: cat.label, phrase: n, matched: raw }
-        }
+/** First prohibited match in the normalised text, or null. */
+function findProhibited(q) {
+  for (const group of COMPILED) {
+    for (const m of group.matchers) {
+      if (m.re.test(q) && !(m.exclude && m.exclude.test(q))) {
+        return { group, term: m.raw }
       }
     }
-  }
-  return best
-}
-
-/** Returns the first deny match (with its kind) in the text, or null. */
-function findDenyTerm(q) {
-  for (const m of DENY_MATCHERS) {
-    if (m.re.test(q)) return m
   }
   return null
 }
 
 /**
- * Evaluate a raw user query against the immutable tables.
- * @returns {{allowed:boolean, code:string|null, label:string|null,
- *            reason:string, matchedTerm:string|null}}
+ * Deterministic screen. Runs before any model call and is authoritative.
+ * @returns {{allowed:boolean, reason:string, code:string|null, label:string|null, matchedTerm:string|null}}
  */
-export function evaluate(rawQuery) {
+export function screen(rawQuery) {
   const q = normalize(rawQuery)
 
   if (!q) {
-    return { allowed: false, code: null, label: null, reason: 'Enter a product to search for.', matchedTerm: null }
+    return { allowed: false, reason: 'Enter a product to search for.', code: null, label: null, matchedTerm: null }
   }
   if (q.length > 80) {
-    return { allowed: false, code: null, label: null, reason: 'Query is too long.', matchedTerm: null }
+    return { allowed: false, reason: 'Query is too long.', code: null, label: null, matchedTerm: null }
   }
 
-  const allow = findAllowPhrase(q)
-
-  // Deny scan runs on the query with the matched allow phrase removed, so an
-  // allow phrase that legitimately contains a denied word ("dress shirt"
-  // contains "dress") doesn't false-positive. Everything else is still
-  // scanned — "polo shirt and jeans" removes "polo shirt", then trips on
-  // "jeans" and is refused.
-  const remainder = allow ? q.replace(termRe(allow.phrase), ' ') : q
-  const deny = findDenyTerm(remainder)
-  if (deny) {
-    const reason = deny.kind === 'below_belt'
-      ? `"${deny.raw}" sits at or below the belt line, so Deal Scout won't search for it. Above-the-belt items only.`
-      : `"${deny.raw}" isn't an above-the-belt item, so Deal Scout won't search for it.`
-    return { allowed: false, code: null, label: null, reason, matchedTerm: deny.raw }
-  }
-
-  if (!allow) {
+  const hit = findProhibited(q)
+  if (hit) {
     return {
       allowed: false,
-      code: null,
-      label: null,
-      reason: "Deal Scout only searches common above-the-belt items — tops, layers, headwear, neckwear and upper-body accessories. That item isn't one of them.",
+      reason: `"${hit.term}" is a prohibited item (${hit.group.label}). This tool won't search for it.`,
+      code: hit.group.code,
+      label: hit.group.label,
+      matchedTerm: hit.term
+    }
+  }
+
+  return { allowed: true, reason: 'No prohibited term detected.', code: null, label: null, matchedTerm: null }
+}
+
+/**
+ * Second gate on the LLM's safety verdict. The model may only ADD a block:
+ *  - code block  -> block, always (unchanged).
+ *  - model "unsafe" with a known category -> block.
+ *  - otherwise -> allow.
+ * A model saying "safe" can never un-block a code match.
+ */
+export function validateSafety(rawQuery, verdict) {
+  const codeVerdict = screen(rawQuery)
+  if (!codeVerdict.allowed) return codeVerdict
+
+  const known = new Set([...PROHIBITED_GROUPS.map((g) => g.code), 'other'])
+  if (verdict?.safe === false && known.has(verdict?.category)) {
+    const label =
+      PROHIBITED_GROUPS.find((g) => g.code === verdict.category)?.label ??
+      'a prohibited item'
+    return {
+      allowed: false,
+      reason: `This request looks like ${label}. This tool won't search for it.`,
+      code: verdict.category,
+      label,
       matchedTerm: null
     }
   }
 
-  return { allowed: true, code: allow.code, label: allow.label, reason: 'Allowed above-the-belt item.', matchedTerm: allow.matched }
+  return codeVerdict
 }
 
-/**
- * Second gate used on LLM output. If the model proposes a category, it must be
- * a real allow code and the phrase it claims to have matched must itself pass
- * `evaluate`. An unknown or denied proposal is rejected. This is why a
- * jailbroken prompt still cannot open the guardrail: the model's answer is
- * re-checked by the same deterministic code.
- */
-export function validateModelVerdict(rawQuery, verdict) {
-  const codeOk = ALLOWED_CATEGORIES.some((c) => c.code === verdict?.code)
-  const phraseOk = typeof verdict?.matchedTerm === 'string' && evaluate(verdict.matchedTerm).allowed
-  if (verdict?.allowed === true && codeOk && phraseOk) {
-    const cat = ALLOWED_CATEGORIES.find((c) => c.code === verdict.code)
-    return { allowed: true, code: cat.code, label: cat.label, reason: 'Confirmed above-the-belt item.', matchedTerm: catalogTermFor(cat.code) }
-  }
-  // Fall back to the deterministic verdict — never trust the model over code.
-  return evaluate(rawQuery)
-}
-
-function catalogTermFor(code) {
-  const cat = ALLOWED_CATEGORIES.find((c) => c.code === code)
-  return cat ? cat.terms[0] : code
-}
-
-/** Cheap helper for the UI's category chips. */
-export function catalog() {
-  return ALLOWED_CATEGORIES.map(({ code, label, terms }) => ({ code, label, example: terms[0] }))
-}
-
-/**
- * Defence in depth: screen a retailer's listing title before it is shown. Any
- * offer whose title names a denied item is dropped, even if the model returned
- * it. Keeps the results list inside the same rule as the search box.
- */
-export function offerTitleAllowed(title) {
+/** Defence in depth: screen a listing title before it is shown. */
+export function offerTitleSafe(title) {
   const q = normalize(title)
   if (!q) return false
-  return findDenyTerm(q) === null
+  return findProhibited(q) === null
+}
+
+/** Example searches for the UI. */
+export const EXAMPLE_QUERIES = [
+  'air fryer',
+  'running shoes',
+  'wireless earbuds',
+  'cast iron skillet',
+  'cotton polo shirt',
+  'yoga mat',
+  'espresso machine',
+  'dash cam'
+]
+
+/** For GET /api/catalog — examples plus the blocked categories. */
+export function catalog() {
+  return {
+    examples: EXAMPLE_QUERIES,
+    prohibited: PROHIBITED_GROUPS.map(({ code, label }) => ({ code, label }))
+  }
 }

@@ -8,9 +8,9 @@ export default function GuardBanner() {
         </svg>
       </span>
       <p className="guard__text">
-        <strong>Scope is locked.</strong> Deal Scout only searches common <em>above-the-belt</em> items —
-        tops, layers, headwear, neckwear and upper-body accessories. US retailers only. This rule lives in
-        server code and cannot be changed from this page or by any prompt.
+        <strong>Filter is locked.</strong> Deal Scout searches everyday products but will never search for{' '}
+        <em>weapons, illegal drugs, adult content, tobacco or alcohol</em>, or anything harmful, hazardous or
+        illicit. The rules live in server code and cannot be changed from this page or by any prompt.
       </p>
     </aside>
   )

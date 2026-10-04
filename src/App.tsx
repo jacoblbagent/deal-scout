@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { getCatalog, search } from './api'
-import type { Category, SearchResponse } from './types'
+import type { Catalog, SearchResponse } from './types'
 import GuardBanner from './components/GuardBanner'
 import SearchBar from './components/SearchBar'
-import CategoryChips from './components/CategoryChips'
+import CategoryChips from './components/ExampleChips'
 import AgentTimeline from './components/AgentTimeline'
 import DealCard from './components/DealCard'
 import BlockedNotice from './components/BlockedNotice'
@@ -13,11 +13,13 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<SearchResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [categories, setCategories] = useState<Category[]>([])
+  const [catalog, setCatalog] = useState<Catalog>({ examples: [], prohibited: [] })
   const abortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
-    getCatalog().then(setCategories).catch(() => setCategories([]))
+    getCatalog()
+      .then(setCatalog)
+      .catch(() => setCatalog({ examples: [], prohibited: [] }))
   }, [])
 
   async function run(q: string) {
@@ -57,7 +59,7 @@ export default function App() {
           <span className="masthead__mark">DS</span>
           <div>
             <h1 className="masthead__title">Deal Scout</h1>
-            <p className="masthead__sub">Best US price on any above-the-belt item</p>
+            <p className="masthead__sub">Best US price on everyday products — minus the harmful stuff</p>
           </div>
         </div>
         <span className="masthead__badge">🇺🇸 US only</span>
@@ -67,7 +69,12 @@ export default function App() {
 
       <section className="console">
         <SearchBar value={query} onChange={setQuery} onSubmit={() => run(query)} loading={loading} />
-        <CategoryChips categories={categories} onPick={pickExample} disabled={loading} />
+        <CategoryChips
+          examples={catalog.examples}
+          prohibited={catalog.prohibited}
+          onPick={pickExample}
+          disabled={loading}
+        />
       </section>
 
       {loading && (
@@ -93,8 +100,8 @@ export default function App() {
             <section className="empty">
               <h2>No US deals confirmed</h2>
               <p>
-                The agent approved <strong>{result.product}</strong> ({result.verdict?.label}) but couldn't
-                confirm a current US listing with a verifiable price. Try a broader term.
+                The agent cleared <strong>{result.product}</strong> but couldn't confirm a current US
+                listing with a verifiable price. Try a broader term.
               </p>
             </section>
           ) : (
