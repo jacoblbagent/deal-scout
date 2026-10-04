@@ -252,6 +252,18 @@ app.post('/api/search', async (req, res) => {
   }
   offers.sort((a, b) => a.effectivePrice - b.effectivePrice)
 
+  // The model's prose can name a deal our US/merchant filter dropped, which
+  // would leave the headline pointing at an offer that isn't in the list.
+  // Keep the model's summary only when it actually refers to the winner;
+  // otherwise state the winner factually.
+  const winner = offers[0] ?? null
+  const modelSummary = String(researchResult.data?.summary ?? '').trim()
+  const summary = winner
+    ? modelSummary && modelSummary.toLowerCase().includes(winner.retailer.toLowerCase())
+      ? modelSummary
+      : `${winner.title} at ${winner.retailer} — $${winner.price.toFixed(2)}`
+    : ''
+
   const dropped = (researchResult.data?.offers?.length ?? 0) - offers.length
   steps.push({
     step: 'rank',
@@ -265,9 +277,9 @@ app.post('/api/search', async (req, res) => {
     query,
     verdict,
     product: researchResult.data?.product ?? query,
-    summary: researchResult.data?.summary ?? '',
+    summary,
     offers,
-    best: offers[0] ?? null,
+    best: winner,
     citations: researchResult.citations,
     steps,
     meta: {
