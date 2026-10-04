@@ -21,6 +21,10 @@ import { fileURLToPath } from 'node:url'
 
 import { screen, validateSafety, offerTitleSafe, catalog } from './guardrail.js'
 import { safetyCheck, research, webSearchEnabled, activeModel } from './agent.js'
+import { resolveImages } from './images.js'
+
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
 const app = express()
 app.use(cors())
@@ -59,7 +63,13 @@ const OK_TLDS = new Set(['com', 'us', 'org', 'net', 'shop', 'store'])
 const NON_MERCHANT = [
   'slickdeals.net', 'dealnews.com', 'bradsdeals.com', 'reddit.com', 'youtube.com',
   'pinterest.com', 'facebook.com', 'instagram.com', 'tiktok.com', 'twitter.com',
-  'x.com', 'medium.com', 'blogspot.com', 'wordpress.com', 'quora.com'
+  'x.com', 'medium.com', 'blogspot.com', 'wordpress.com', 'quora.com',
+  'thestreet.com', 'cnet.com', 'nytimes.com', 'forbes.com', 'businessinsider.com',
+  'engadget.com', 'theverge.com', 'tomsguide.com', 'goodhousekeeping.com',
+  'consumerreports.org', 'wirecutter.com', 'digitaltrends.com', 'techradar.com',
+  'gizmodo.com', 'pcmag.com', 'wired.com', 'people.com', 'buzzfeed.com',
+  'yahoo.com', 'msn.com', 'aol.com', 'huffpost.com', 'cnn.com', 'usatoday.com',
+  'wikipedia.org'
 ]
 
 function isUSListing(url) {
@@ -125,6 +135,60 @@ app.get('/api/health', (_req, res) => {
 
 app.get('/api/catalog', (_req, res) => {
   res.json(catalog())
+})
+
+// ---------------------------------------------------------------------------
+// Image proxy. Retailer CDNs reject hotlinks (referrer checks) and some send
+// no CORS headers, so the browser can't load their images directly. We fetch
+// server-side and re-serve. Guarded against SSRF: https only, no private or
+// loopback hosts, and the host must be a US retailer or a known image CDN.
+// ---------------------------------------------------------------------------
+const PRIVATE_HOST_RE =
+  /^(localhost|127\.|0\.0\.0\.0|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?)/i
+const IMAGE_HOST_SUFFIXES = [
+  'scene7.com', 'walmartimages.com', 'media-amazon.com', 'ssl-images-amazon.com',
+  'images-amazon.com', 'cloudfront.net', 'imgix.net', 'shopifycdn.com',
+  'hm.com', 'akamaized.net', 'cloudinary.com', 'bigcommerce.com', 'sfccdn.com',
+  'contentful.com', 'scene7.com', 'netsuite.com', 'footlocker.com', 'dickssportinggoods.com'
+]
+
+function imageHostAllowed(host) {
+  if (PRIVATE_HOST_RE.test(host)) return false
+  if (IMAGE_HOST_SUFFIXES.some((s) => host === s || host.endsWith('.' + s))) return true
+  return isUSListing('https://' + host + '/')
+}
+
+app.get('/api/image', async (req, res) => {
+  const raw = typeof req.query.u === 'string' ? req.query.u : ''
+  let parsed
+  try {
+    parsed = new URL(raw)
+  } catch {
+    return res.status(400).json({ ok: false, reason: 'Bad image URL' })
+  }
+  if (parsed.protocol !== 'https:') {
+    return res.status(400).json({ ok: false, reason: 'https only' })
+  }
+  if (!imageHostAllowed(parsed.hostname.toLowerCase())) {
+    return res.status(403).json({ ok: false, reason: 'Host not allowed' })
+  }
+  try {
+    const upstream = await fetch(parsed, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(12000),
+      headers: { 'User-Agent': BROWSER_UA, Accept: 'image/*,*/*;q=0.8' }
+    })
+    if (!upstream.ok) return res.status(502).end()
+    const ct = upstream.headers.get('content-type') || ''
+    if (!ct.startsWith('image/')) return res.status(415).end()
+    const buf = Buffer.from(await upstream.arrayBuffer())
+    if (buf.length > 6 * 1024 * 1024) return res.status(413).end()
+    res.set('Content-Type', ct)
+    res.set('Cache-Control', 'public, max-age=86400')
+    res.send(buf)
+  } catch {
+    res.status(502).end()
+  }
 })
 
 app.post('/api/search', async (req, res) => {
@@ -269,6 +333,17 @@ app.post('/api/search', async (req, res) => {
     step: 'rank',
     status: 'ok',
     detail: `${offers.length} US offers kept${dropped > 0 ? ` · ${dropped} dropped (non-US or out-of-scope)` : ''}`
+  })
+
+  // Attach a real product image per offer. Best-effort and never invented:
+  // null means "no image found", and the UI shows a placeholder.
+  const imageMap = await resolveImages(offers.map((o) => o.url))
+  for (const o of offers) o.image = imageMap.get(o.url) ?? null
+  const withImage = offers.filter((o) => o.image).length
+  steps.push({
+    step: 'images',
+    status: 'ok',
+    detail: `${withImage}/${offers.length} product images resolved`
   })
 
   res.json({

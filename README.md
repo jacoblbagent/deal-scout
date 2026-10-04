@@ -34,6 +34,26 @@ Deal Scout is a general shopping agent — it searches for everyday products. Wh
 
 ---
 
+## Product images
+
+Each offer carries a real product image, sourced from the retailer's own page — never invented or searched for.
+
+- **Stage 1 (cheap):** a server-side fetch of the offer URL, reading `og:image` / `twitter:image` / JSON-LD `image`. Covers Target, Adobe/Scene7-backed stores, and Shopify-style shops.
+- **Stage 2 (headless):** Walmart, Amazon, Home Depot, Dick's and H&M all serve bot walls to plain requests, so when stage 1 is blocked a real headless Chromium visits the page and pulls the main product photo out of the live DOM (Amazon needs this — it has no `og:image`).
+- **Proxy:** retailer CDNs reject hotlinks and often send no CORS headers, so images are streamed through `GET /api/image?u=…`. That endpoint is SSRF-guarded: https only, no private/loopback hosts, and the host must be a US retailer or a known image CDN.
+- **No image found → a neutral placeholder tile.** We never substitute an unrelated photo.
+
+`playwright-core` is an **optional dependency**. To enable stage 2:
+
+```bash
+npm i playwright-core
+npx playwright-core install chromium
+```
+
+Without it the app still runs; offers that stage 1 can't resolve just show the placeholder. Bot-walled retailers mean coverage is typically **50–80%** of offers per search — a paid image API would close the gap.
+
+---
+
 ## Stack
 
 - **Frontend:** React 18 + Vite + TypeScript + SCSS (`src/`)
@@ -79,6 +99,7 @@ Requires Node 18+ (developed on Node 22).
 
 - `GET /api/health` — liveness, active model, whether web search is on
 - `GET /api/catalog` — example searches + the blocked categories (used by the UI)
+- `GET /api/image?u=<imageUrl>` — SSRF-guarded image proxy for retailer CDNs
 - `POST /api/search` `{ "query": "..." }` — returns `{ blocked, verdict, offers, best, steps, meta }`
 
 ## Layout
@@ -88,6 +109,7 @@ server/
   index.js        Express API + US-only + merchant-direct + post-filters + ranking
   guardrail.js    THE immutable prohibited-term tables + screen/validate
   agent.js        free-Nemotron calls (safety classifier + grounded US deal research)
+  images.js       real product-image resolution (plain fetch -> headless fallback)
 src/
   App.tsx         main UI
   components/     SearchBar, ExampleChips, AgentTimeline, DealCard, ...

@@ -16,6 +16,7 @@ export interface Offer {
   shipping: number | null
   effectivePrice: number
   notes: string
+  image: string | null
 }
 
 export interface Verdict {
